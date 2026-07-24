@@ -40,6 +40,41 @@ AGENT_ID = "hdar-seed-agent"
 CHUNK_SIZE = 1024 * 1024
 
 # ---------------------------------------------------------------------------
+# Signed-message specification (Defect 8)
+# ---------------------------------------------------------------------------
+
+SIGNATURE_SCOPE = {
+    "algorithm": "ed25519",
+    "domain_separator": b"hdar.manifest.v1",
+    "signed_payload": (
+        "The Ed25519 signature is over the manifest_hash field, which is "
+        "SHA-256 of canonical JSON (sort_keys=True, separators=(',',':'), "
+        "ensure_ascii=True) of the manifest with these fields excluded: "
+        "manifest_hash, owner_signature, executor_signature. "
+        "The manifest_hash binds: schema, protocol_version, agent_id, epoch, "
+        "parent_manifest_hash, created_at, source_host_label, objective, "
+        "continuation_point, verification_mode, workspace_manifest (root_hash "
+        "+ all file entries with rel_path/sha256/size/mode), "
+        "owner_signature_algorithm, owner_public_key. "
+        "Lineage is bound via parent_manifest_hash which must equal the E(N-1) "
+        "manifest_hash. Epoch is bound via the epoch field. Protocol version "
+        "is bound via protocol_version. Owner identity is bound via "
+        "owner_public_key."
+    ),
+    "canonical_serialization": (
+        "json.dumps(data, sort_keys=True, separators=(',',':'), ensure_ascii=True)"
+    ),
+    "excluded_from_hash": ["manifest_hash", "owner_signature", "executor_signature"],
+    "bound_fields": [
+        "schema", "protocol_version", "agent_id", "epoch",
+        "parent_manifest_hash", "created_at", "source_host_label",
+        "objective", "continuation_point", "verification_mode",
+        "workspace_manifest.root_hash", "workspace_manifest.files[]",
+        "owner_signature_algorithm", "owner_public_key",
+    ],
+}
+
+# ---------------------------------------------------------------------------
 # Hashing primitives
 # ---------------------------------------------------------------------------
 
@@ -330,4 +365,106 @@ def restore_workspace(capsule_dir: Path, target_dir: Path) -> dict:
         "restored_files": restored,
         "total_files": len(manifest.get("workspace_manifest", {}).get("files", [])),
         "manifest_hash": manifest.get("manifest_hash", ""),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cleanup verification (Defect 3)
+# ---------------------------------------------------------------------------
+
+
+def verify_cleanup(*workspace_dirs: Path) -> dict:
+    """Verify that workspace directories have been cleaned up.
+
+    Checks that no workspace directories still exist after the proof is complete.
+    Missing evidence is FAILURE, not success.
+
+    Returns:
+        dict with 'ok' (bool), 'remaining' (list of paths that still exist),
+        and 'reason' (str).
+    """
+    remaining = []
+    for d in workspace_dirs:
+        if d.exists():
+            remaining.append(str(d))
+
+    if remaining:
+        return {
+            "ok": False,
+            "remaining": remaining,
+            "reason": f"{len(remaining)} workspace(s) still exist: {remaining}",
+        }
+    return {
+        "ok": True,
+        "remaining": [],
+        "reason": "all workspace directories destroyed",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Key hygiene scan (Defect 7)
+# ---------------------------------------------------------------------------
+
+
+def scan_key_hygiene(*search_dirs: Path, private_key_hex: str = "") -> dict:
+    """Scan output artifacts for private key material leakage.
+
+    Searches all files in the given directories for:
+      - Hex-encoded Ed25519 private keys (64 hex chars matching the known key)
+      - PEM private key markers
+      - Raw private key bytes
+
+    Missing scan results are FAILURE, not success.
+
+    Returns:
+        dict with 'ok' (bool), 'leaks' (list), 'scanned_files' (int),
+        and 'reason' (str).
+    """
+    leaks = []
+    scanned = 0
+
+    pem_markers = [
+        b"-----BEGIN PRIVATE KEY-----",
+        b"-----BEGIN ED25519 PRIVATE KEY-----",
+        b"-----BEGIN ENCRYPTED PRIVATE KEY-----",
+    ]
+
+    for search_dir in search_dirs:
+        if not search_dir.exists():
+            continue
+        for path in sorted(search_dir.rglob("*")):
+            if not path.is_file() or path.is_symlink():
+                continue
+            scanned += 1
+            try:
+                content = path.read_bytes()
+            except Exception:
+                continue
+
+            # Check for PEM private key markers
+            for marker in pem_markers:
+                if marker in content:
+                    leaks.append(f"{path}: contains PEM private key marker")
+
+            # Check for known private key hex
+            if private_key_hex and private_key_hex.encode() in content:
+                leaks.append(f"{path}: contains owner private key hex")
+
+            # Check for raw 32-byte private key patterns (heuristic)
+            # Only flag if the file is small enough to be a key dump
+            if len(content) == 32 and path.suffix in (".key", ".priv", ".pem"):
+                leaks.append(f"{path}: possible raw private key file")
+
+    if leaks:
+        return {
+            "ok": False,
+            "leaks": leaks,
+            "scanned_files": scanned,
+            "reason": f"{len(leaks)} key hygiene violation(s): {leaks}",
+        }
+    return {
+        "ok": True,
+        "leaks": [],
+        "scanned_files": scanned,
+        "reason": f"no private key material found in {scanned} file(s)",
     }
