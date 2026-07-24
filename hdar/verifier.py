@@ -117,7 +117,7 @@ class Verifier:
         """
         all_match, per_epoch = chain_a.cross_platform_match(chain_b)
 
-        mismatched = [r["epoch"] for r in per_epoch if not r.get("match", False)]
+        mismatched = [r["epoch"] for r in per_epoch if "epoch" in r and not r.get("match", False)]
         matching = len(per_epoch) - len(mismatched)
 
         platform_a = chain_a.attestations[0].platform.get("platform_string", "unknown") if chain_a.length else "empty"
